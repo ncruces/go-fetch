@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"mime"
 	"net/http"
 	"os"
@@ -38,6 +39,7 @@ func usage() {
 }
 
 func main() {
+	// parse command line args
 	flag.Usage = usage
 	flag.Parse()
 
@@ -50,30 +52,38 @@ func main() {
 	target = flag.Arg(1)
 	stdout = target == "-"
 
+	log.SetFlags(0)
+
 	// is target a directory?
 	if !stdout {
-		fi, err := os.Stat(target)
-		if err != nil && !os.IsNotExist(err) {
-			panic(err) // can't access target
+		if strings.HasSuffix(target, string(filepath.Separator)) {
+			targetIsDir = true
+		} else {
+			fi, _ := os.Stat(target)
+			targetIsDir = fi != nil && fi.IsDir()
 		}
-		targetIsDir = fi != nil && fi.IsDir() || // target is a directory
-			strings.HasSuffix(target, string(filepath.Separator)) // target should be a directory
+	}
+
+	if abs, err := filepath.Abs(target); err != nil {
+		log.Fatal(err)
+	} else {
+		target = abs
 	}
 
 	// start download
 	res, err := http.Get(source)
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusOK {
-		panic(res.Status)
+		log.Fatal(res.Status)
 	}
 
-	// setup target file name
-	if !stdout && targetIsDir {
-		// try content disposition
+	// target file name
+	if targetIsDir {
+		// use content disposition
 		if disp := res.Header.Get("Content-Disposition"); disp != "" {
 			if _, params, err := mime.ParseMediaType(disp); err != nil {
 				targetName = params["filename"]
@@ -85,54 +95,58 @@ func main() {
 			targetName = path.Base(res.Request.URL.Path)
 		}
 
-		// use base name from original use, since it's more predictable
+		// use the base name of the source url, since it's more predictable
 		if len(path.Ext(targetName)) <= 1 {
 			targetName = path.Base(source)
 		}
 	}
 
 	if *unpack {
-		unpackArchive(bufio.NewReader(res.Body))
+		uncompress(bufio.NewReader(res.Body))
 	} else {
-		writeAll(targetWriter(), res.Body)
+		copy(targetFile(), res.Body)
 	}
 }
 
-func targetWriter() io.WriteCloser {
+func targetFile() *os.File {
 	if stdout {
 		return os.Stdout
 	}
 	if targetIsDir {
+		prefix := target + string(filepath.Separator)
 		target = filepath.Join(target, targetName)
+		if !strings.HasPrefix(target, prefix) {
+			log.Fatalf("illegal file path: %s", targetName)
+		}
 	}
 	if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 	f, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 	return f
 }
 
-func writeAll(w io.WriteCloser, r io.Reader) {
+func copy(w io.WriteCloser, r io.Reader) {
 	_, err := io.Copy(w, r)
 	if cerr := w.Close(); err == nil {
 		err = cerr
 	}
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 }
 
-func unpackArchive(r *bufio.Reader) {
+func uncompress(r *bufio.Reader) {
 	magic, _ := r.Peek(264)
 
 	switch {
 	case bytes.HasPrefix(magic, []byte("\x1f\x8b")):
 		zr, err := gzip.NewReader(r)
 		if err != nil {
-			panic(err)
+			log.Fatal(err)
 		}
 		defer zr.Close()
 
@@ -142,57 +156,62 @@ func unpackArchive(r *bufio.Reader) {
 			targetName = strings.TrimSuffix(targetName, ".gz")
 		}
 
-		unpackArchive(bufio.NewReader(zr))
+		uncompress(bufio.NewReader(zr))
 
 	case bytes.HasPrefix(magic, []byte("BZh")):
 		targetName = strings.TrimSuffix(targetName, ".bz2")
 		br := bzip2.NewReader(r)
-		unpackArchive(bufio.NewReader(br))
+		uncompress(bufio.NewReader(br))
 
 	case !stdout && bytes.HasPrefix(magic, []byte("PK")):
-		unarchive(target, zipstream.NewReader(r))
+		unarchive(zipstream.NewReader(r))
 
 	case !stdout && len(magic) > 257 && bytes.HasPrefix(magic[257:], []byte("ustar")):
-		unarchive(target, tar.NewReader(r))
+		unarchive(tar.NewReader(r))
 
 	default:
-		writeAll(targetWriter(), r)
+		copy(targetFile(), r)
 	}
 }
 
-func unarchive(dst string, a io.Reader) {
+func unarchive(a io.Reader) {
+	prefix := target + string(filepath.Separator)
+
 	for {
 		name, fi, err := unarchiveNext(a)
 		if err == io.EOF {
 			return
 		}
 		if err != nil {
-			panic(err)
+			log.Fatal(err)
 		}
 
-		target := filepath.Join(dst, name)
+		path := filepath.Join(target, name)
+		if !strings.HasPrefix(path, prefix) {
+			log.Fatalf("illegal file path: %s", name)
+		}
 
 		switch {
 		case fi.IsDir():
-			if err := os.MkdirAll(target, fi.Mode()|0300); err != nil {
-				panic(err)
+			if err := os.MkdirAll(path, fi.Mode()|0300); err != nil {
+				log.Fatal(err)
 			}
 
 		case fi.Mode().IsRegular():
-			f, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, fi.Mode())
+			f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, fi.Mode())
 			if err != nil {
-				panic(err)
+				log.Fatal(err)
 			}
-			writeAll(f, a)
+			copy(f, a)
 
 		case fi.Mode()&os.ModeSymlink != 0:
 			old, err := ioutil.ReadAll(a)
 			if err != nil {
-				panic(err)
+				log.Fatal(err)
 			}
-			err = os.Symlink(string(old), target)
+			err = os.Symlink(string(old), path)
 			if err != nil {
-				panic(err)
+				log.Fatal(err)
 			}
 		}
 	}
