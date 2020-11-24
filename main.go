@@ -119,7 +119,7 @@ func targetFile() *os.File {
 			log.Fatalf("illegal file path: %s", targetName)
 		}
 	}
-	if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(target), 0777); err != nil {
 		log.Fatal(err)
 	}
 	f, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
@@ -175,6 +175,10 @@ func uncompress(r *bufio.Reader) {
 }
 
 func unarchive(a io.Reader) {
+	if err := os.MkdirAll(target, 0777); err != nil {
+		log.Fatal(err)
+	}
+
 	prefix := target + string(filepath.Separator)
 
 	for {
@@ -186,7 +190,7 @@ func unarchive(a io.Reader) {
 			log.Fatal(err)
 		}
 
-		path := filepath.Join(target, name)
+		path := filepath.Join(target, filepath.FromSlash(name))
 		if !strings.HasPrefix(path, prefix) {
 			log.Fatalf("illegal file path: %s", name)
 		}
@@ -213,6 +217,9 @@ func unarchive(a io.Reader) {
 			if err != nil {
 				log.Fatal(err)
 			}
+
+		default:
+			log.Fatalf("archive contained unsupported file type %v", fi.Mode())
 		}
 	}
 }
