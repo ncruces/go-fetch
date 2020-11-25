@@ -13,6 +13,7 @@ import (
 	"log"
 	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -64,12 +65,6 @@ func main() {
 		}
 	}
 
-	if abs, err := filepath.Abs(target); err != nil {
-		log.Fatal(err)
-	} else {
-		target = abs
-	}
-
 	// start download
 	res, err := http.Get(source)
 	if err != nil {
@@ -78,7 +73,7 @@ func main() {
 	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusOK {
-		log.Fatal(res.Status)
+		log.Fatal("http error: ", res.Status)
 	}
 
 	// target file name
@@ -97,14 +92,18 @@ func main() {
 
 		// use the base name of the source url, since it's more predictable
 		if len(path.Ext(targetName)) <= 1 {
-			targetName = path.Base(source)
+			u, _ := url.Parse(source)
+			targetName = path.Base(u.Path)
 		}
 	}
 
 	if *unpack {
-		uncompress(bufio.NewReader(res.Body))
+		err = uncompress(bufio.NewReader(res.Body))
 	} else {
-		copy(targetFile(), res.Body)
+		err = write(res.Body, targetFile())
+	}
+	if err != nil {
+		log.Fatal(err)
 	}
 }
 
@@ -112,41 +111,46 @@ func targetFile() *os.File {
 	if stdout {
 		return os.Stdout
 	}
+
+	path := target
 	if targetIsDir {
-		prefix := target + string(filepath.Separator)
-		target = filepath.Join(target, targetName)
-		if !strings.HasPrefix(target, prefix) {
-			log.Fatalf("illegal file path: %s", targetName)
+		name := filepath.FromSlash(targetName)
+		if strings.ContainsRune(name, filepath.Separator) {
+			log.Fatalf("illegal file path: %q", targetName)
 		}
+		path = filepath.Join(path, name)
 	}
-	if err := os.MkdirAll(filepath.Dir(target), 0777); err != nil {
+
+	path, err := filepath.Abs(path)
+	if err != nil {
 		log.Fatal(err)
 	}
-	f, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
+	if err := os.MkdirAll(filepath.Dir(path), 0777); err != nil {
+		log.Fatal(err)
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
 	if err != nil {
 		log.Fatal(err)
 	}
 	return f
 }
 
-func copy(w io.WriteCloser, r io.Reader) {
+func write(r io.Reader, w io.WriteCloser) error {
 	_, err := io.Copy(w, r)
 	if cerr := w.Close(); err == nil {
 		err = cerr
 	}
-	if err != nil {
-		log.Fatal(err)
-	}
+	return err
 }
 
-func uncompress(r *bufio.Reader) {
+func uncompress(r *bufio.Reader) error {
 	magic, _ := r.Peek(264)
 
 	switch {
 	case bytes.HasPrefix(magic, []byte("\x1f\x8b")):
 		zr, err := gzip.NewReader(r)
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 		defer zr.Close()
 
@@ -156,72 +160,101 @@ func uncompress(r *bufio.Reader) {
 			targetName = strings.TrimSuffix(targetName, ".gz")
 		}
 
-		uncompress(bufio.NewReader(zr))
+		return uncompress(bufio.NewReader(zr))
 
 	case bytes.HasPrefix(magic, []byte("BZh")):
 		targetName = strings.TrimSuffix(targetName, ".bz2")
 		br := bzip2.NewReader(r)
-		uncompress(bufio.NewReader(br))
+		return uncompress(bufio.NewReader(br))
 
 	case !stdout && bytes.HasPrefix(magic, []byte("PK")):
-		unarchive(zipstream.NewReader(r))
+		return unarchive(zipstream.NewReader(r), target)
 
 	case !stdout && len(magic) > 257 && bytes.HasPrefix(magic[257:], []byte("ustar")):
-		unarchive(tar.NewReader(r))
+		return unarchive(tar.NewReader(r), target)
 
 	default:
-		copy(targetFile(), r)
+		return write(r, targetFile())
 	}
 }
 
-func unarchive(a io.Reader) {
-	if err := os.MkdirAll(target, 0777); err != nil {
-		log.Fatal(err)
+func unarchive(r io.Reader, dir string) error {
+	dir, err := filepath.Abs(dir)
+	if err != nil {
+		return err
+	}
+	dir += string(filepath.Separator)
+
+	if err := os.MkdirAll(dir, 0777); err != nil {
+		return err
 	}
 
-	prefix := target + string(filepath.Separator)
-
 	for {
-		name, fi, err := unarchiveNext(a)
+		name, fi, err := unarchiveNext(r)
 		if err == io.EOF {
-			return
+			return nil
 		}
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 
-		path := filepath.Join(target, filepath.FromSlash(name))
-		if !strings.HasPrefix(path, prefix) {
-			log.Fatalf("illegal file path: %s", name)
+		path := filepath.Join(dir, filepath.FromSlash(name))
+		if !strings.HasPrefix(path, dir) {
+			return fmt.Errorf("illegal file path %q", name)
 		}
 
-		switch {
-		case fi.IsDir():
-			if err := os.MkdirAll(path, fi.Mode()|0300); err != nil {
-				log.Fatal(err)
+		switch mode := fi.Mode(); {
+		case mode.IsDir():
+			if err := os.MkdirAll(path, unarchivePerm(mode)); err != nil {
+				return err
 			}
 
-		case fi.Mode().IsRegular():
-			f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, fi.Mode())
+		case mode.IsRegular():
+			f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
 			if err != nil {
-				log.Fatal(err)
+				return err
 			}
-			copy(f, a)
 
-		case fi.Mode()&os.ModeSymlink != 0:
-			old, err := ioutil.ReadAll(a)
-			if err != nil {
-				log.Fatal(err)
+			n, err := io.Copy(f, r)
+			if cerr := f.Close(); err == nil {
+				err = cerr
 			}
+			if err != nil {
+				return fmt.Errorf("error writing to %q: %w", name, err)
+			}
+			if size := fi.Size(); n != size {
+				return fmt.Errorf("wrote %d bytes to %q; expected %d", n, name, size)
+			}
+
+			if time := fi.ModTime(); !time.IsZero() {
+				_ = os.Chtimes(path, time, time)
+			}
+
+		case mode&os.ModeSymlink != 0:
+			old, err := ioutil.ReadAll(r)
+			if err != nil {
+				return err
+			}
+
 			err = os.Symlink(string(old), path)
 			if err != nil {
-				log.Fatal(err)
+				return err
 			}
 
 		default:
-			log.Fatalf("archive contained unsupported file type %v", fi.Mode())
+			return fmt.Errorf("archive contained unsupported file %q of type %v", name, mode)
 		}
 	}
+}
+
+func unarchivePerm(mode os.FileMode) os.FileMode {
+	if mode&0007 != 0 {
+		mode |= 0001
+	}
+	if mode&0070 != 0 {
+		mode |= 0010
+	}
+	return mode | 0300
 }
 
 func unarchiveNext(a io.Reader) (string, os.FileInfo, error) {
@@ -241,6 +274,6 @@ func unarchiveNext(a io.Reader) (string, os.FileInfo, error) {
 		return h.Name, h.FileInfo(), nil
 
 	default:
-		panic(fmt.Sprintf("unknown type %T", v))
+		panic(fmt.Sprintf("unarchive: unknown type %T", v))
 	}
 }
